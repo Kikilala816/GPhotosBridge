@@ -1,122 +1,4 @@
-package com.bridge.gphotos
-
-import android.app.*
-import android.content.Context
-import android.content.Intent
-import android.media.MediaScannerConnection
-import android.net.wifi.WifiManager
-import android.os.Build
-import android.os.Environment
-import android.os.IBinder
-import android.os.PowerManager
-import fi.iki.elonen.NanoHTTPD
-import java.io.ByteArrayOutputStream
-import java.io.File
-import java.io.FileOutputStream
-import java.net.InetAddress
-import java.util.concurrent.ConcurrentHashMap
-import javax.jmdns.JmDNS
-import javax.jmdns.ServiceInfo
-
-class ReceiverService : Service() {
-    private var server: BridgeServer? = null
-    private var wakeLock: PowerManager.WakeLock? = null
-    private var multicastLock: WifiManager.MulticastLock? = null
-    private var jmdns: JmDNS? = null
-
-    companion object {
-        var isRunning = false
-        var savedCount = 0
-        var lastFile = "None yet"
-        const val ACTION_UPDATE = "com.bridge.gphotos.UPDATE"
-    }
-
-    override fun onCreate() {
-        super.onCreate()
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "GPhotosBridge::WakeLock")
-        wakeLock?.acquire()
-
-        startForegroundServiceNotification()
-        server = BridgeServer(applicationContext, 5000)
-        server?.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
-        startMdnsBroadcast()
-
-        isRunning = true
-        broadcastUpdate()
-    }
-
-    private fun startMdnsBroadcast() {
-        Thread {
-            try {
-                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                multicastLock = wm.createMulticastLock("GPhotosBridge::Multicast").apply {
-                    setReferenceCounted(true)
-                    acquire()
-                }
-                val ipInt = wm.connectionInfo.ipAddress
-                if (ipInt != 0) {
-                    val ipBytes = byteArrayOf(
-                        (ipInt and 0xff).toByte(),
-                        (ipInt shr 8 and 0xff).toByte(),
-                        (ipInt shr 16 and 0xff).toByte(),
-                        (ipInt shr 24 and 0xff).toByte()
-                    )
-                    val addr = InetAddress.getByAddress(ipBytes)
-                    jmdns = JmDNS.create(addr, "pixelbridge")
-                    val serviceInfo = ServiceInfo.create("_http._tcp.local.", "PixelBridge", 5000, "GPhotos Bridge")
-                    jmdns?.registerService(serviceInfo)
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }.start()
-    }
-
-    override fun onDestroy() {
-        Thread {
-            try {
-                jmdns?.unregisterAllServices()
-                jmdns?.close()
-                if (multicastLock?.isHeld == true) multicastLock?.release()
-            } catch (e: Exception) {}
-        }.start()
-        server?.stop()
-        if (wakeLock?.isHeld == true) wakeLock?.release()
-        isRunning = false
-        broadcastUpdate()
-        super.onDestroy()
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    private fun broadcastUpdate() {
-        sendBroadcast(Intent(ACTION_UPDATE).setPackage(packageName))
-    }
-
-    private fun startForegroundServiceNotification() {
-        val channelId = "gphotos_bridge_channel"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                channelId, "Live Photo Receiver",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        }
-        val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, channelId)
-        } else {
-            Notification.Builder(this)
-        }
-            .setContentTitle("GPhotos Bridge Active")
-            .setContentText("Listening on port 5000 for iPhone Live Photos...")
-            .setSmallIcon(android.R.drawable.stat_sys_upload_done)
-            .build()
-
-        startForeground(1, notification)
-    }
-
-    inner class BridgeServer(private val ctx: Context, port: Int) : NanoHTTPD(port) {
+inner class BridgeServer(private val ctx: Context, port: Int) : NanoHTTPD(port) {
         private val pendingJpegs = ConcurrentHashMap<String, ByteArray>()
         private val saveDir = File(
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
@@ -143,12 +25,19 @@ class ReceiverService : Service() {
 
                 when (partType) {
                     "live-image" -> {
+                        if (bodyBytes.isEmpty()) {
+                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "Empty image body for $baseName")
+                        }
                         pendingJpegs[baseName] = bodyBytes
-                        newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, "Cached JPEG for $baseName")
+                        newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, "Cached JPEG for $baseName (${bodyBytes.size} bytes)")
                     }
                     "live-video" -> {
                         val imgBytes = pendingJpegs.remove(baseName)
-                            ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "Missing JPEG for $baseName")
+                            ?: return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "Missing JPEG cache for $baseName")
+
+                        if (bodyBytes.isEmpty()) {
+                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "Empty video body for $baseName")
+                        }
 
                         val outFile = File(saveDir, "${baseName}_MP.jpg")
                         val xmpSegment = createMotionPhotoXmp(bodyBytes.size)
@@ -167,7 +56,7 @@ class ReceiverService : Service() {
                         val outFile = File(saveDir, "$baseName.$ext")
                         FileOutputStream(outFile).use { it.write(bodyBytes) }
                         scanFile(outFile)
-                        newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, "Saved Media: ${outFile.name}")
+                        newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, "Saved Media: ${outFile.name} (${bodyBytes.size} bytes)")
                     }
                 }
             } catch (e: Exception) {
@@ -177,14 +66,24 @@ class ReceiverService : Service() {
         }
 
         private fun readExactBytes(input: java.io.InputStream, length: Int): ByteArray {
-            val buffer = ByteArrayOutputStream(if (length > 0) length else 32768)
+            val buffer = ByteArrayOutputStream()
             val data = ByteArray(16384)
-            var remaining = length
-            while (remaining > 0) {
-                val read = input.read(data, 0, minOf(data.size, remaining))
-                if (read == -1) break
-                buffer.write(data, 0, read)
-                remaining -= read
+            if (length > 0) {
+                var remaining = length
+                while (remaining > 0) {
+                    val read = input.read(data, 0, minOf(data.size, remaining))
+                    if (read == -1) break
+                    buffer.write(data, 0, read)
+                    remaining -= read
+                }
+            } else {
+                // Fallback: Read until EOF if content-length is missing or 0
+                var read: Int
+                while (true) {
+                    read = input.read(data)
+                    if (read == -1) break
+                    buffer.write(data, 0, read)
+                }
             }
             return buffer.toByteArray()
         }
@@ -220,4 +119,3 @@ class ReceiverService : Service() {
             MediaScannerConnection.scanFile(ctx, arrayOf(file.absolutePath), null, null)
         }
     }
-}
