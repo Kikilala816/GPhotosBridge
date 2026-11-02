@@ -4,6 +4,7 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.media.MediaScannerConnection
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Environment
 import android.os.IBinder
@@ -12,11 +13,16 @@ import fi.iki.elonen.NanoHTTPD
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.net.InetAddress
 import java.util.concurrent.ConcurrentHashMap
+import javax.jmdns.JmDNS
+import javax.jmdns.ServiceInfo
 
 class ReceiverService : Service() {
     private var server: BridgeServer? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
+    private var jmdns: JmDNS? = null
 
     companion object {
         var isRunning = false
@@ -34,11 +40,47 @@ class ReceiverService : Service() {
         startForegroundServiceNotification()
         server = BridgeServer(applicationContext, 5000)
         server?.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
+        startMdnsBroadcast()
+
         isRunning = true
         broadcastUpdate()
     }
 
+    private fun startMdnsBroadcast() {
+        Thread {
+            try {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                multicastLock = wm.createMulticastLock("GPhotosBridge::Multicast").apply {
+                    setReferenceCounted(true)
+                    acquire()
+                }
+                val ipInt = wm.connectionInfo.ipAddress
+                if (ipInt != 0) {
+                    val ipBytes = byteArrayOf(
+                        (ipInt and 0xff).toByte(),
+                        (ipInt shr 8 and 0xff).toByte(),
+                        (ipInt shr 16 and 0xff).toByte(),
+                        (ipInt shr 24 and 0xff).toByte()
+                    )
+                    val addr = InetAddress.getByAddress(ipBytes)
+                    jmdns = JmDNS.create(addr, "pixelbridge")
+                    val serviceInfo = ServiceInfo.create("_http._tcp.local.", "PixelBridge", 5000, "GPhotos Bridge")
+                    jmdns?.registerService(serviceInfo)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }.start()
+    }
+
     override fun onDestroy() {
+        Thread {
+            try {
+                jmdns?.unregisterAllServices()
+                jmdns?.close()
+                if (multicastLock?.isHeld == true) multicastLock?.release()
+            } catch (e: Exception) {}
+        }.start()
         server?.stop()
         if (wakeLock?.isHeld == true) wakeLock?.release()
         isRunning = false
@@ -75,7 +117,6 @@ class ReceiverService : Service() {
     }
 
     inner class BridgeServer(private val ctx: Context, port: Int) : NanoHTTPD(port) {
-        // Temporary cache holding the JPEG half of a Live Photo until the MOV arrives
         private val pendingJpegs = ConcurrentHashMap<String, ByteArray>()
         private val saveDir = File(
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
@@ -92,7 +133,7 @@ class ReceiverService : Service() {
 
             return try {
                 val headers = session.headers
-                val partType = headers["x-part"] ?: "normal" // "live-image", "live-video", or "normal"
+                val partType = headers["x-part"] ?: "normal"
                 val rawName = headers["x-filename"] ?: "IMG_${System.currentTimeMillis()}.jpg"
                 val baseName = rawName.substringBeforeLast(".")
                 val ext = rawName.substringAfterLast(".", "jpg")
@@ -113,13 +154,9 @@ class ReceiverService : Service() {
                         val xmpSegment = createMotionPhotoXmp(bodyBytes.size)
 
                         FileOutputStream(outFile).use { fos ->
-                            // 1. JPEG SOI marker (0xFF 0xD8)
                             fos.write(imgBytes, 0, 2)
-                            // 2. Google GCamera MicroVideo XMP APP1 header
                             fos.write(xmpSegment)
-                            // 3. Rest of original JPEG (preserving 100% of Apple EXIF/GPS/Timestamp)
                             fos.write(imgBytes, 2, imgBytes.size - 2)
-                            // 4. Raw QuickTime MOV video appended at the end
                             fos.write(bodyBytes)
                         }
 
