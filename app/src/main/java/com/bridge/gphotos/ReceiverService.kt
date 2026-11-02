@@ -1,4 +1,122 @@
-inner class BridgeServer(private val ctx: Context, port: Int) : NanoHTTPD(port) {
+package com.bridge.gphotos
+
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.media.MediaScannerConnection
+import android.net.wifi.WifiManager
+import android.os.Build
+import android.os.Environment
+import android.os.IBinder
+import android.os.PowerManager
+import fi.iki.elonen.NanoHTTPD
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.net.InetAddress
+import java.util.concurrent.ConcurrentHashMap
+import javax.jmdns.JmDNS
+import javax.jmdns.ServiceInfo
+
+class ReceiverService : Service() {
+    private var server: BridgeServer? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
+    private var jmdns: JmDNS? = null
+
+    companion object {
+        var isRunning = false
+        var savedCount = 0
+        var lastFile = "None yet"
+        const val ACTION_UPDATE = "com.bridge.gphotos.UPDATE"
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "GPhotosBridge::WakeLock")
+        wakeLock?.acquire()
+
+        startForegroundServiceNotification()
+        server = BridgeServer(applicationContext, 5000)
+        server?.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
+        startMdnsBroadcast()
+
+        isRunning = true
+        broadcastUpdate()
+    }
+
+    private fun startMdnsBroadcast() {
+        Thread {
+            try {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                multicastLock = wm.createMulticastLock("GPhotosBridge::Multicast").apply {
+                    setReferenceCounted(true)
+                    acquire()
+                }
+                val ipInt = wm.connectionInfo.ipAddress
+                if (ipInt != 0) {
+                    val ipBytes = byteArrayOf(
+                        (ipInt and 0xff).toByte(),
+                        (ipInt shr 8 and 0xff).toByte(),
+                        (ipInt shr 16 and 0xff).toByte(),
+                        (ipInt shr 24 and 0xff).toByte()
+                    )
+                    val addr = InetAddress.getByAddress(ipBytes)
+                    jmdns = JmDNS.create(addr, "pixelbridge")
+                    val serviceInfo = ServiceInfo.create("_http._tcp.local.", "PixelBridge", 5000, "GPhotos Bridge")
+                    jmdns?.registerService(serviceInfo)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }.start()
+    }
+
+    override fun onDestroy() {
+        Thread {
+            try {
+                jmdns?.unregisterAllServices()
+                jmdns?.close()
+                if (multicastLock?.isHeld == true) multicastLock?.release()
+            } catch (e: Exception) {}
+        }.start()
+        server?.stop()
+        if (wakeLock?.isHeld == true) wakeLock?.release()
+        isRunning = false
+        broadcastUpdate()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun broadcastUpdate() {
+        sendBroadcast(Intent(ACTION_UPDATE).setPackage(packageName))
+    }
+
+    private fun startForegroundServiceNotification() {
+        val channelId = "gphotos_bridge_channel"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId, "Live Photo Receiver",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        }
+        val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, channelId)
+        } else {
+            Notification.Builder(this)
+        }
+            .setContentTitle("GPhotos Bridge Active")
+            .setContentText("Listening on port 5000 for iPhone Live Photos...")
+            .setSmallIcon(android.R.drawable.stat_sys_upload_done)
+            .build()
+
+        startForeground(1, notification)
+    }
+
+    inner class BridgeServer(private val ctx: Context, port: Int) : NanoHTTPD(port) {
         private val pendingJpegs = ConcurrentHashMap<String, ByteArray>()
         private val saveDir = File(
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
@@ -77,7 +195,6 @@ inner class BridgeServer(private val ctx: Context, port: Int) : NanoHTTPD(port) 
                     remaining -= read
                 }
             } else {
-                // Fallback: Read until EOF if content-length is missing or 0
                 var read: Int
                 while (true) {
                     read = input.read(data)
@@ -119,3 +236,4 @@ inner class BridgeServer(private val ctx: Context, port: Int) : NanoHTTPD(port) 
             MediaScannerConnection.scanFile(ctx, arrayOf(file.absolutePath), null, null)
         }
     }
+}
