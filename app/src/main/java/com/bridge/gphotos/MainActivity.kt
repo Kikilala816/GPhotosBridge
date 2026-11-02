@@ -17,7 +17,9 @@ import android.widget.TextView
 
 class MainActivity : Activity() {
     private lateinit var statusText: TextView
-    private lateinit var ipText: TextView
+    private lateinit var codeHeader: TextView
+    private lateinit var codeDisplay: TextView
+    private lateinit var urlSubtext: TextView
     private lateinit var counterText: TextView
     private lateinit var toggleBtn: Button
 
@@ -41,41 +43,57 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             setBackgroundColor(Color.parseColor("#121212"))
-            setPadding(64, 64, 64, 64)
+            setPadding(48, 48, 48, 48)
         }
 
         val title = TextView(this).apply {
-            text = "Pixel XL Live Photo Bridge"
-            textSize = 24f
+            text = "Pixel XL GPhotos Bridge"
+            textSize = 22f
             setTextColor(Color.WHITE)
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
         }
 
         statusText = TextView(this).apply {
-            textSize = 18f
+            textSize = 16f
             gravity = Gravity.CENTER
-            setPadding(0, 32, 0, 16)
+            setPadding(0, 24, 0, 24)
         }
 
-        ipText = TextView(this).apply {
-            textSize = 20f
+        codeHeader = TextView(this).apply {
+            text = "CONNECTION CODE"
+            textSize = 12f
+            setTextColor(Color.parseColor("#9AA0A6"))
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+        }
+
+        codeDisplay = TextView(this).apply {
+            textSize = 56f
             setTextColor(Color.parseColor("#8AB4F8"))
             typeface = Typeface.MONOSPACE
             gravity = Gravity.CENTER
-            setPadding(0, 16, 0, 32)
+            setPadding(0, 0, 0, 8)
+        }
+
+        urlSubtext = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.parseColor("#9AA0A6"))
+            typeface = Typeface.MONOSPACE
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, 32)
         }
 
         counterText = TextView(this).apply {
-            textSize = 16f
+            textSize = 14f
             setTextColor(Color.parseColor("#BDC1C6"))
             gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 64)
+            setPadding(0, 0, 0, 48)
         }
 
         toggleBtn = Button(this).apply {
-            textSize = 18f
-            setPadding(48, 36, 48, 36)
+            textSize = 16f
+            setPadding(48, 32, 48, 32)
             setOnClickListener {
                 val serviceIntent = Intent(this@MainActivity, ReceiverService::class.java)
                 if (ReceiverService.isRunning) {
@@ -92,7 +110,9 @@ class MainActivity : Activity() {
 
         layout.addView(title)
         layout.addView(statusText)
-        layout.addView(ipText)
+        layout.addView(codeHeader)
+        layout.addView(codeDisplay)
+        layout.addView(urlSubtext)
         layout.addView(counterText)
         layout.addView(toggleBtn)
         setContentView(layout)
@@ -101,7 +121,6 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         registerReceiver(receiver, IntentFilter(ReceiverService.ACTION_UPDATE))
-        // Auto-start server as soon as she opens the app!
         if (!ReceiverService.isRunning && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED) {
             val serviceIntent = Intent(this, ReceiverService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(serviceIntent) else startService(serviceIntent)
@@ -114,18 +133,23 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
-    private fun getWifiIp(): String {
+    private fun getWifiDetails(): Triple<String, String, String> {
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         val ip = Formatter.formatIpAddress(wm.connectionInfo.ipAddress)
-        return if (ip == "0.0.0.0") "Check Wi-Fi Connection" else "http://$ip:5000"
+        if (ip == "0.0.0.0") return Triple("---", "No Wi-Fi Connection", "")
+        val lastOctet = ip.substringAfterLast(".")
+        return Triple(lastOctet, "http://pixelbridge.local:5000", "IP: $ip:5000")
     }
 
     private fun updateUI() {
         val running = ReceiverService.isRunning
-        statusText.text = if (running) "● RECEIVER READY" else "○ RECEIVER STOPPED"
+        val (code, mdnsUrl, fullIp) = getWifiDetails()
+        statusText.text = if (running) "● READY TO RECEIVE" else "○ RECEIVER STOPPED"
         statusText.setTextColor(if (running) Color.parseColor("#81C995") else Color.parseColor("#F28B82"))
-        ipText.text = getWifiIp()
-        counterText.text = "Files received this session: ${ReceiverService.savedCount}\nLast saved: ${ReceiverService.lastFile}\nTarget: /DCIM/GPhotos"
+        
+        codeDisplay.text = code
+        urlSubtext.text = "$mdnsUrl\n$fullIp"
+        counterText.text = "Saved this session: ${ReceiverService.savedCount}\nLast: ${ReceiverService.lastFile}\nPath: /DCIM/GPhotos"
         toggleBtn.text = if (running) "Stop Receiver" else "Start Receiver"
     }
 }
